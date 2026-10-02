@@ -1,0 +1,8 @@
+/dataset
+/bert-base-chinese
+/bert-base-uncased
+/checkpoint
+/log
+/*.pkl
+/*.pth
+/.idea
