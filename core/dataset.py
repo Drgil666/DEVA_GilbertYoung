@@ -6,10 +6,10 @@
 
 import logging
 import pickle
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-
+from torch.utils.data import Dataset,DataLoader
 
 __all__ = ['MMDataLoader']
 
@@ -133,8 +133,8 @@ def MMDataLoader(args):
         'test': MMDataset(args, mode='test')
     }
 
-    if 'seq_lens' in args:
-        args.seq_lens = datasets['train'].get_seq_len() 
+    if hasattr(args,'seq_lens'):
+        args.seq_lens = datasets['train'].get_seq_len()
 
     dataLoader = {
         ds: DataLoader(datasets[ds],

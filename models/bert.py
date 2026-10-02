@@ -3,10 +3,11 @@
 * @description: Functions of BERT.
 '''
 
+import os
 
 import torch
 import torch.nn as nn
-from transformers import BertModel, BertTokenizer, RobertaModel, RobertaTokenizer
+from transformers import BertModel,BertTokenizer,RobertaModel,RobertaTokenizer
 
 __all__ = ['BertTextEncoder']
 
@@ -15,6 +16,21 @@ TRANSFORMERS_MAP = {
     'roberta': (RobertaModel, RobertaTokenizer),
 }
 
+# 本地 BERT 模型目录（项目根目录下的 bert-base-uncased / bert-base-chinese）
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_BERT_MAP = {
+    'bert-base-uncased':os.path.join(_PROJECT_ROOT,'bert-base-uncased'),
+    'bert-base-chinese':os.path.join(_PROJECT_ROOT,'bert-base-chinese'),
+}
+
+
+def _resolve_pretrained(pretrained):
+    """优先使用本地模型目录；本地不存在则回退到 HuggingFace 名称下载"""
+    local_path = LOCAL_BERT_MAP.get(pretrained)
+    if local_path and os.path.isdir(local_path):
+        return local_path
+    return pretrained
+
 
 class BertTextEncoder(nn.Module):
     def __init__(self, use_finetune=False, transformers='bert', pretrained='bert-base-uncased'):
@@ -22,8 +38,9 @@ class BertTextEncoder(nn.Module):
 
         tokenizer_class = TRANSFORMERS_MAP[transformers][1]
         model_class = TRANSFORMERS_MAP[transformers][0]
-        self.tokenizer = tokenizer_class.from_pretrained(pretrained)
-        self.model = model_class.from_pretrained(pretrained)
+        model_path = _resolve_pretrained(pretrained)
+        self.tokenizer = tokenizer_class.from_pretrained(model_path)
+        self.model = model_class.from_pretrained(model_path)
         self.use_finetune = use_finetune
     
     def get_tokenizer(self):

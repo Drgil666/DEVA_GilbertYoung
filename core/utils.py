@@ -6,6 +6,7 @@
 
 import os
 import random
+
 import numpy as np
 import torch
 
@@ -48,3 +49,24 @@ def save_model(save_path, epoch, model, optimizer):
         'optimizer': optimizer.state_dict(),
     }
     torch.save(states, save_file_path)
+
+
+def save_best_model(save_path,seed,model,optimizer,epoch):
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    save_file_path = os.path.join(save_path,'best_seed_{}.pth'.format(seed))
+    states = {
+        'epoch':epoch,
+        'state_dict':model.state_dict(),
+        'optimizer':optimizer.state_dict(),
+    }
+    torch.save(states,save_file_path)
+
+
+def load_best_model(save_path,seed,model):
+    save_file_path = os.path.join(save_path,'best_seed_{}.pth'.format(seed))
+    if not os.path.exists(save_file_path):
+        return None
+    checkpoint = torch.load(save_file_path,map_location='cpu')
+    model.load_state_dict(checkpoint['state_dict'])
+    return checkpoint.get('epoch')

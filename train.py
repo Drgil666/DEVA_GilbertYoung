@@ -1,21 +1,20 @@
+import csv
 import os
-import torch
-import numpy as np
-from tqdm import tqdm
-from opts import *
-from core.dataset import MMDataLoader
-from core.scheduler import get_scheduler
-from core.utils import AverageMeter, save_model, setup_seed
-from tensorboardX import SummaryWriter
-from models.deva import build_model
-from core.metric import MetricsTop
 import pickle
 import time
-opt = parse_opts()
-os.environ["CUDA_VISIBLE_DEVICES"] = opt.CUDA_VISIBLE_DEVICES
-USE_CUDA = torch.cuda.is_available()
-device = torch.device("cuda" if USE_CUDA else "cpu")
-print("device: {}:{}".format(device, opt.CUDA_VISIBLE_DEVICES))
+
+import torch
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+
+from core.dataset import MMDataLoader
+from core.metric import MetricsTop
+from core.scheduler import get_scheduler
+from core.utils import AverageMeter,setup_seed,save_best_model,load_best_model
+from models.deva import build_model
+from opts import *
+
+device = None
 
 
 train_mae, val_mae = [], []
@@ -34,49 +33,155 @@ def load_pkl(path):
     print("读取成功")
     return obj
 
-def main():
-    opt = parse_opts()
-    if opt.seed is not None:
-        setup_seed(opt.seed)
-    print("seed: {}".format(opt.seed))
-    
-    log_path = os.path.join(".", "log", opt.project_name)
-    if os.path.exists(log_path) == False:
-        os.makedirs(log_path)
+
+def get_metric_columns(datasetName):
+    if datasetName == 'sims':
+        return ['F1_score','Mult_acc_2','Mult_acc_3','Mult_acc_5','MAE','Corr']
+    else:  # mosi / mosei
+        return ['Has0_acc_2','Has0_F1_score','Non0_acc_2','Non0_F1_score',
+                'Mult_acc_5','Mult_acc_7','MAE','Corr']
+
+
+def get_acc2_name(datasetName):
+    """返回「Acc_2」指标名：mosi/mosei 用 Non0_acc_2，sims 用 Mult_acc_2"""
+    if datasetName == 'sims':
+        return 'Mult_acc_2'
+    else:
+        return 'Non0_acc_2'
+
+
+def write_test_csv(results,train_start_time,log_path,datasetName,seed=None):
+    columns = get_metric_columns(datasetName)
+    csv_path = os.path.join(log_path,'test_metrics.csv')
+    os.makedirs(os.path.dirname(csv_path),exist_ok=True)
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path,'a',newline='') as f:
+        writer = csv.DictWriter(f,fieldnames=['time','seed']+columns)
+        if write_header:
+            writer.writeheader()
+        row = {'time':train_start_time,'seed':seed}
+        for c in columns:
+            v = results.get(c)
+            row[c] = round(float(v),4) if v is not None else ''
+        writer.writerow(row)
+
+
+def write_log_line(log_path,phase,epoch,results,seed=None):
+    log_file = os.path.join(log_path,'training_log.txt')
+    os.makedirs(os.path.dirname(log_file),exist_ok=True)
+    with open(log_file,'a',encoding='utf-8') as f:
+        f.write('[{}][seed {}][epoch {}][{}] {}\n'.format(
+            time.strftime('%Y-%m-%d %H:%M:%S'),seed,epoch,phase,results))
+
+
+def average_metrics(results):
+    """对多个指标字典求平均（数值字段取平均）"""
+    avg = {}
+    for key in results[0].keys():
+        vals = [float(r[key]) for r in results if r.get(key) is not None]
+        avg[key] = round(sum(vals)/len(vals),4) if vals else ''
+    return avg
+
+
+def write_summary_csv(avg_results,csv_path,datasetName):
+    columns = get_metric_columns(datasetName)
+    os.makedirs(os.path.dirname(csv_path),exist_ok=True)
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path,'a',newline='') as f:
+        writer = csv.DictWriter(f,fieldnames=columns)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({c:avg_results.get(c,'') for c in columns})
+
+
+def main(config=None):
+    global device
+    if config is None:
+        config = parse_opts()
+    os.environ["CUDA_VISIBLE_DEVICES"] = config.CUDA_VISIBLE_DEVICES
+    USE_CUDA = torch.cuda.is_available()
+    device = torch.device("cuda" if USE_CUDA else "cpu")
+    print("device: {}:{}".format(device,config.CUDA_VISIBLE_DEVICES))
+
+    # 归一化 seed：支持单个 int 或列表
+    seeds = config.seed
+    if seeds is None:
+        seeds = [None]
+    elif not isinstance(seeds,(list,tuple)):
+        seeds = [seeds]
+
+    log_path = os.path.join(".","log",config.project_name)
+    os.makedirs(log_path,exist_ok=True)
     print("log_path :", log_path)
 
-    save_path = os.path.join(opt.models_save_root,  opt.project_name)
-    if os.path.exists(save_path) == False:
-        os.makedirs(save_path)
+    save_path = os.path.join(config.models_save_root,config.project_name)
+    os.makedirs(save_path,exist_ok=True)
     print("model_save_path :", save_path)
 
-    model = build_model(opt).to(device)
-
-    dataLoader = MMDataLoader(opt)
-
-    optimizer = torch.optim.AdamW(model.parameters(),
-                                 lr=opt.lr,
-                                 weight_decay=opt.weight_decay)
-
-    scheduler_warmup = get_scheduler(optimizer, opt)
+    dataLoader = MMDataLoader(config)
     loss_fn = torch.nn.MSELoss()
-    metrics = MetricsTop().getMetics(opt.datasetName)
+    metrics = MetricsTop().getMetics(config.datasetName)
 
-    writer = SummaryWriter(logdir=log_path)
+    all_seed_results = []
+
+    for seed in seeds:
+        if seed is not None:
+            setup_seed(seed)
+        print("seed: {}".format(seed))
+
+        model = build_model(config).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(),
+                                      lr=config.lr,
+                                      weight_decay=config.weight_decay)
+        scheduler_warmup = get_scheduler(optimizer,config)
+        writer = SummaryWriter(logdir=log_path)
+
+        train_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        best_test = None
+        acc2_name = get_acc2_name(config.datasetName)
+        best_val = -1.0
+        best_epoch = 0
+        patience = 0
+        for epoch in range(1,config.n_epochs+1):
+            train(model,dataLoader['train'],optimizer,loss_fn,epoch,writer,metrics,config,seed)
+            val_results = evaluate(model,dataLoader['valid'],optimizer,loss_fn,epoch,writer,save_path,metrics,config,
+                                   seed)
+            if config.is_test is not None:
+                test(model,dataLoader['test'],optimizer,loss_fn,epoch,writer,metrics,config,seed)
+            if val_results is not None and val_results.get(acc2_name) is not None:
+                if val_results[acc2_name] > best_val:
+                    best_val = val_results[acc2_name]
+                    best_epoch = epoch
+                    patience = 0
+                    save_best_model(save_path,seed,model,optimizer,epoch)
+                else:
+                    patience += 1
+                    if patience >= config.early_stop:
+                        print('Early stopping at epoch {}'.format(epoch))
+                        break
+            scheduler_warmup.step()
+        # 回滚到验证集最优权重，并用其重新评估测试集
+        load_best_model(save_path,seed,model)
+        print('Rolled back to best validation weights (epoch {})'.format(best_epoch))
+        if config.is_test is not None:
+            best_test = test(model,dataLoader['test'],optimizer,loss_fn,best_epoch,writer,metrics,config,seed)
+        writer.close()
+
+        if best_test is not None:
+            write_test_csv(best_test,train_start_time,log_path,config.datasetName,seed)
+            all_seed_results.append(best_test)
+
+    # 平均所有 seed 的结果
+    if len(all_seed_results) > 1:
+        avg_results = average_metrics(all_seed_results)
+        print('==== 平均结果（{} 个 seed）===='.format(len(all_seed_results)))
+        print(avg_results)
+        summary_csv = os.path.join(log_path,'seed_avg_metrics.csv')
+        write_summary_csv(avg_results,summary_csv,config.datasetName)
+        print('平均结果已保存到 {}'.format(summary_csv))
 
 
-    for epoch in range(1, opt.n_epochs+1):
-        show_list = []
-        train(model, dataLoader['train'], optimizer, loss_fn, epoch, writer, metrics)
-        evaluate(model, dataLoader['valid'], optimizer, loss_fn, epoch, writer, save_path, metrics)
-        if opt.is_test is not None:
-            pre_dict = test(model, dataLoader['test'], optimizer, loss_fn, epoch, writer, metrics)
-            show_list.append(pre_dict)
-        scheduler_warmup.step()
-    writer.close()
-
-
-def train(model, train_loader, optimizer, loss_fn, epoch, writer, metrics):
+def train(model,train_loader,optimizer,loss_fn,epoch,writer,metrics,config=None,seed=None):
     train_pbar = tqdm(enumerate(train_loader))
     losses = AverageMeter()
 
@@ -112,11 +217,14 @@ def train(model, train_loader, optimizer, loss_fn, epoch, writer, metrics):
     print('train: ', train_results)
     train_mae.append(train_results['MAE'])
 
+    if config is not None:
+        log_path = os.path.join(".","log",config.project_name)
+        write_log_line(log_path,'train',epoch,train_results,seed)
+
     writer.add_scalar('train/loss', losses.value_avg, epoch)
 
 
-
-def evaluate(model, eval_loader, optimizer, loss_fn, epoch, writer, save_path, metrics):
+def evaluate(model,eval_loader,optimizer,loss_fn,epoch,writer,save_path,metrics,config=None,seed=None):
     test_pbar = tqdm(enumerate(eval_loader))
 
     losses = AverageMeter()
@@ -147,16 +255,20 @@ def evaluate(model, eval_loader, optimizer, loss_fn, epoch, writer, save_path, m
 
         pred, true = torch.cat(y_pred), torch.cat(y_true)
         test_results = metrics(pred, true)
-        print(test_results)
+        print('valid: ',test_results)
+
+        if config is not None:
+            log_path = os.path.join(".","log",config.project_name)
+            write_log_line(log_path,'val',epoch,test_results,seed)
 
         writer.add_scalar('evaluate/loss', losses.value_avg, epoch)
         # if epoch == 28:
         #     save_model(save_path, epoch, model, optimizer)
 
+        return test_results
 
-def test(model, test_loader, optimizer, loss_fn, epoch, writer, metrics):
 
-    start_time = time.time()
+def test(model,test_loader,optimizer,loss_fn,epoch,writer,metrics,config=None,seed=None):
 
     test_pbar = tqdm(enumerate(test_loader))
 
@@ -181,10 +293,6 @@ def test(model, test_loader, optimizer, loss_fn, epoch, writer, metrics):
 
             # output, h_at, h_a, h_fusion_a, h_vt, h_v, h_fusion_v, h_t, h_fusion_t = model(img, audio, text, audio_text, vision_text)
             output = model(img, audio, text, audio_text, vision_text)
-            print(id)
-            print(output.view(1, -1))
-            print(label.view(1, -1))
-            print("----")
 
             loss = loss_fn(output, label)
 
@@ -208,19 +316,19 @@ def test(model, test_loader, optimizer, loss_fn, epoch, writer, metrics):
 
         pred, true = torch.cat(y_pred), torch.cat(y_true)
         test_results = metrics(pred, true)
-        print(test_results)
+        print('test: ',test_results)
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"Elapsed time: {elapsed_time} seconds")  
+        if config is not None:
+            log_path = os.path.join(".","log",config.project_name)
+            write_log_line(log_path,'test',epoch,test_results,seed)
 
         writer.add_scalar('test/loss', losses.value_avg, epoch)
 
-        # present_dict = {'h_at':h_at_list, 'h_a':h_a_list, 'h_fusion_a': h_fusion_a_list, 
-        #                 'h_vt':h_vt_list, 'h_v': h_v_list, 'h_fusion_v': h_fusion_v_list, 
+        # present_dict = {'h_at':h_at_list, 'h_a':h_a_list, 'h_fusion_a': h_fusion_a_list,
+        #                 'h_vt':h_vt_list, 'h_v': h_v_list, 'h_fusion_v': h_fusion_v_list,
         #                 'h_t': h_t_list, 'h_fusion_t':h_fusion_t_list}
 
-        # return present_dict
+        return test_results
 
 
 if __name__ == '__main__':
