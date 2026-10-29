@@ -3,7 +3,6 @@
 '''
 
 import torch
-import torch.nn.functional as F
 from einops import repeat
 from torch import nn
 
@@ -16,7 +15,7 @@ class DEVA(nn.Module):
         super(DEVA,self).__init__()
 
         # Note that when modifying T, it needs to be modified here.
-        self.h_minor = nn.Parameter(torch.ones(1,8,128))
+        self.h_minor = nn.Parameter(torch.ones(1,8,384))
 
         self.bertmodel = BertTextEncoder(use_finetune=True,transformers='bert',pretrained=bert_pretrained)
 
@@ -51,35 +50,37 @@ class DEVA(nn.Module):
         self.proj_vl = Transformer(num_frames=50,save_hidden=False,token_len=8,dim=128,depth=1,heads=8,mlp_dim=128)
 
         # Note that when modifying T, text_encoder to modify num_frames, CrossTransformer to modify source_num_frames and tgt_num_frames,
-        self.text_encoder = Transformer(num_frames=50,save_hidden=True,token_len=None,dim=128,depth=MFU_depth-1,heads=8,
-                                        mlp_dim=128)
-        self.h_tpf_layer = TPFLearningEncoder(dim=128,depth=MFU_depth,heads=8,dim_head=16,dropout=0.)
-        self.fusion_layer = CrossTransformer(source_num_frames=8,tgt_num_frames=8,dim=128,depth=fusion_layer_depth,
-                                             heads=8,mlp_dim=128)
+        self.text_encoder = Transformer(num_frames=50,save_hidden=True,token_len=None,dim=384,depth=MFU_depth-1,heads=8,
+                                        mlp_dim=384)
+        self.h_tpf_layer = TPFLearningEncoder(dim=384,depth=MFU_depth,heads=8,dim_head=48,dropout=0.)
+        self.fusion_layer = CrossTransformer(source_num_frames=8,tgt_num_frames=8,dim=384,depth=fusion_layer_depth,
+                                             heads=8,mlp_dim=384)
         self.fusion_layer_concat = nn.Linear(128+128,128)  # The final fusion module is concat.
         self.fusion_layer_add = nn.Linear(128,128)  # Finally, the fusion module is added.
 
         # the post_vvtfusion layers
-        self.vvtfusion_dropout = nn.Dropout(p=0.1)
-        self.vvtfusion_layer = nn.Linear(128+128,128)  # 'video_out': 32 + 'video_text_out': 768, 32
+        # SIMS:0.1/0.1/0.0
+        # MOSI:0.2/0.2/0.0
+        self.vvtfusion_dropout = nn.Dropout(p=0.2)
+        self.vvtfusion_layer = nn.Linear(128+128,384)  # 256 -> 384 up-projection
 
         self.vvtfusion_transformer = Transformer(num_frames=50,save_hidden=False,token_len=None,dim=128+128,depth=1,
-                                                 heads=8,mlp_dim=128)
+                                                 heads=8,mlp_dim=256)
 
         # the post_aatfusion layers
-        self.aatfusion_dropout = nn.Dropout(p=0.1)
-        self.aatfusion_layer = nn.Linear(128+128,128)  # 'audio_out': 16 + 768, 16
+        self.aatfusion_dropout = nn.Dropout(p=0.2)
+        self.aatfusion_layer = nn.Linear(128+128,384)  # 256 -> 384 up-projection
         self.aatfusion_transformer = Transformer(num_frames=50,save_hidden=False,token_len=None,dim=128+128,depth=1,
-                                                 heads=8,mlp_dim=128)
+                                                 heads=8,mlp_dim=256)
 
         # the post_avttfusion layers
-        self.avttfusion_dropout = nn.Dropout(p=0.0)
-        self.avttfusion_layer = nn.Linear(128+128+128,128)  # 768+768+768, 768
+        self.avttfusion_dropout = nn.Dropout(p=0.2)
         self.avttfusion_transformer = Transformer(num_frames=50,save_hidden=False,token_len=None,dim=128+128+128,
                                                   depth=1,
-                                                  heads=8,mlp_dim=128)
+                                                  heads=8,mlp_dim=384)
 
         self.cls_head = nn.Sequential(
+            nn.Linear(384,128),
             nn.Linear(128,1)
         )
 
@@ -111,29 +112,25 @@ class DEVA(nn.Module):
         # Combine audio and audio_text
         h_fusion_a = torch.cat([h_fusion_a,h_at],dim=-1)
         h_fusion_a = self.aatfusion_dropout(h_fusion_a)
-        # h_fusion_a = F.relu(self.aatfusion_layer(h_fusion_a))
         h_fusion_a = self.aatfusion_transformer(h_fusion_a)
-        h_fusion_a = F.relu(self.aatfusion_layer(h_fusion_a))
+        h_fusion_a = self.aatfusion_layer(h_fusion_a)
 
         # Combining vision and vision_text
         h_fusion_v = torch.cat([h_fusion_v,h_vt],dim=-1)
         h_fusion_v = self.vvtfusion_dropout(h_fusion_v)
-        # h_fusion_v = F.relu(self.vvtfusion_layer(h_fusion_v))
         h_fusion_v = self.vvtfusion_transformer(h_fusion_v)
-        h_fusion_v = F.relu(self.vvtfusion_layer(h_fusion_v))
+        h_fusion_v = self.vvtfusion_layer(h_fusion_v)
 
         # Combine text and audio_text vision_text
         h_fusion_t = torch.cat([h_vt,h_at,h_t],dim=-1)
         h_fusion_t = self.avttfusion_dropout(h_fusion_t)
-        # h_fusion_t = F.relu(self.avttfusion_layer(h_fusion_t))
         h_fusion_t = self.avttfusion_transformer(h_fusion_t)
-        h_fusion_t = F.relu(self.avttfusion_layer(h_fusion_t))
 
         h_t_list = self.text_encoder(h_fusion_t)
 
-        h_minor = self.h_tpf_layer(h_t_list,h_fusion_a,h_fusion_v,h_minor)  # ([64, 8, 128])
+        h_minor = self.h_tpf_layer(h_t_list,h_fusion_a,h_fusion_v,h_minor)  # ([64, 8, 384])
 
-        feat = self.fusion_layer(h_minor,h_t_list[-1])[:,0]  # ([64, 128])
+        feat = self.fusion_layer(h_minor,h_t_list[-1])[:,0]  # ([64, 384])
 
         output = self.cls_head(feat)
 

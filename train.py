@@ -138,8 +138,7 @@ def main(config=None):
 
         train_start_time = time.strftime('%Y-%m-%d %H:%M:%S')
         best_test = None
-        acc2_name = get_acc2_name(config.datasetName)
-        best_val = -1.0
+        best_val = float('inf')
         best_epoch = 0
         patience = 0
         for epoch in range(1,config.n_epochs+1):
@@ -148,9 +147,9 @@ def main(config=None):
                                    seed)
             if config.is_test is not None:
                 test(model,dataLoader['test'],optimizer,loss_fn,epoch,writer,metrics,config,seed)
-            if val_results is not None and val_results.get(acc2_name) is not None:
-                if val_results[acc2_name] > best_val:
-                    best_val = val_results[acc2_name]
+            if val_results is not None and val_results.get('MAE') is not None:
+                if val_results['MAE'] < best_val:
+                    best_val = val_results['MAE']
                     best_epoch = epoch
                     patience = 0
                     save_best_model(save_path,seed,model,optimizer,epoch)
@@ -162,7 +161,7 @@ def main(config=None):
             scheduler_warmup.step()
         # 回滚到验证集最优权重，并用其重新评估测试集
         load_best_model(save_path,seed,model)
-        print('Rolled back to best validation weights (epoch {})'.format(best_epoch))
+        print('Rolled back to best validation weights (epoch {}, best MAE {:.4f})'.format(best_epoch,best_val))
         if config.is_test is not None:
             best_test = test(model,dataLoader['test'],optimizer,loss_fn,best_epoch,writer,metrics,config,seed)
         writer.close()
